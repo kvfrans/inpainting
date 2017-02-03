@@ -10,20 +10,22 @@ def get_image(image_path, image_size, is_crop=True):
 
 def transform(image, npx=32, is_crop=True):
     # npx : # of pixels width/height of image
-    if is_crop:
-        cropped_image = center_crop(image, npx)
-    else:
-        cropped_image = image
+    # if is_crop:
+    cropped_image = center_crop(image, 108)
+    # else:
+    #     cropped_image = image
+
+    cropped_image = scipy.misc.imresize(cropped_image, (64,64))
+
     return np.array(cropped_image)/127.5 - 1.
 
-def center_crop(x, crop_h, crop_w=None, resize_w=32):
+def center_crop(x, crop_h, crop_w=None, resize_w=108):
     if crop_w is None:
         crop_w = crop_h
     h, w = x.shape[:2]
     j = int(round((h - crop_h)/2.))
     i = int(round((w - crop_w)/2.))
-    return scipy.misc.imresize(x[j:j+crop_h, i:i+crop_w],
-                               [resize_w, resize_w])
+    return x[j:j+crop_h, i:i+crop_w]
 
 def imread(path):
     readimage = scipy.misc.imread(path).astype(np.float)
