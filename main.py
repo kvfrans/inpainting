@@ -1,94 +1,253 @@
 import tensorflow as tf
 import numpy as np
+import os
+from glob import glob
+import sys
+import math
+from random import randint
+
+import ops
 from ops import *
 from utils import *
-from glob import glob
-import os
 
-class Inpaint():
-    def __init__(self):
 
-        self.img_size = 64
-        self.num_colors = 3
 
-        self.batch_size = 64
+class Color():
+    def __init__(self, imgsize=256, batchsize=4):
+        self.batch_size = batchsize
+        self.batch_size_sqrt = int(math.sqrt(self.batch_size))
+        self.image_size = imgsize
+        self.output_size = imgsize
 
-        self.images = tf.placeholder(tf.float32, [None, self.img_size, self.img_size, self.num_colors])
-        self.broken_images = tf.placeholder(tf.float32, [None, self.img_size, self.img_size, self.num_colors])
+        self.gf_dim = 64
+        self.df_dim = 64
 
-        d_bn1 = batch_norm(name='d_bn1')
-        d_bn2 = batch_norm(name='d_bn2')
-        d_bn3 = batch_norm(name='d_bn3')
+        self.input_colors = 1
+        self.input_colors2 = 3
+        self.output_colors = 3
 
-        g_bn0 = batch_norm(name='g_bn0')
-        g_bn1 = batch_norm(name='g_bn1')
-        g_bn2 = batch_norm(name='g_bn2')
-        g_bn3 = batch_norm(name='g_bn3')
-        g_bn4 = batch_norm(name='g_bn4')
+        self.l1_scaling = 100
 
-        # breaking down the context
-        h0 = lrelu(conv2d(self.broken_images, self.num_colors, 64, name='d_h0_conv')) #32x32x64
-        h1 = lrelu(d_bn1(conv2d(h0, 64, 128, name='d_h1_conv'))) #16x16x128
-        h2 = lrelu(d_bn2(conv2d(h1, 128, 256, name='d_h2_conv'))) #8x8x256
-        h2_2 = lrelu(d_bn3(conv2d(h2, 256, 256, name='d_h3_conv'))) #4x4x256
+        self.d_bn1 = batch_norm(name='d_bn1')
+        self.d_bn2 = batch_norm(name='d_bn2')
+        self.d_bn3 = batch_norm(name='d_bn3')
 
-        bridge = dense(tf.reshape(h2_2, [self.batch_size, -1]), 4*4*256, 4*4*256, scope='d_h3_lin') #256
+        self.line_images = tf.placeholder(tf.float32, [self.batch_size, self.image_size, self.image_size, self.input_colors])
+        self.color_images = tf.placeholder(tf.float32, [self.batch_size, self.image_size, self.image_size, self.input_colors2])
+        self.real_images = tf.placeholder(tf.float32, [self.batch_size, self.image_size, self.image_size, self.output_colors])
 
-        # generating the new replacement
-        h3 = tf.nn.relu(g_bn0(tf.reshape(bridge, [-1, 4, 4, 256]))) # 4x4x256
-        h4 = tf.nn.relu(g_bn2(conv_transpose(h3, [self.batch_size, 8, 8, 128], "g_h4"))) #8x8x128
-        h5 = tf.nn.relu(g_bn3(conv_transpose(h4, [self.batch_size, 16, 16, 128], "g_h5"))) #16x16x128
-        self.generated_images = tf.nn.tanh(g_bn4(conv_transpose(h5, [self.batch_size, 32, 32, 3], "g_h6"))) #32x32x3
-        self.target = tf.slice(self.images,[0, 16, 16, 0], [self.batch_size, 32, 32, 3])
+        combined_preimage = tf.concat(3, [self.line_images, self.color_images])
+        # combined_preimage = self.line_images
 
-        self.generation_loss = tf.nn.l2_loss(self.target - self.generated_images)
+        self.generated_images = self.generator(combined_preimage)
 
-        self.cost = self.generation_loss
-        optimizer = tf.train.AdamOptimizer(1e-2, beta1=0.5)
-        grads = optimizer.compute_gradients(self.cost)
-        for i,(g,v) in enumerate(grads):
-            if g is not None:
-                grads[i] = (tf.clip_by_norm(g,5),v)
-        self.train_op = optimizer.apply_gradients(grads)
+        self.real_AB = tf.concat(3, [combined_preimage, self.real_images])
+        self.fake_AB = tf.concat(3, [combined_preimage, self.generated_images])
 
-        # self.train_op = self.cost
+        self.disc_true, disc_true_logits = self.discriminator(self.real_AB, reuse=False)
+        self.disc_fake, disc_fake_logits = self.discriminator(self.fake_AB, reuse=True)
 
-        self.sess = tf.Session()
-        self.sess.run(tf.initialize_all_variables())
+        self.d_loss_real = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(disc_true_logits, tf.ones_like(disc_true_logits)))
+        self.d_loss_fake = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(disc_fake_logits, tf.zeros_like(disc_fake_logits)))
+        self.d_loss = self.d_loss_real + self.d_loss_fake
+
+        self.g_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(disc_fake_logits, tf.ones_like(disc_fake_logits))) \
+                        + self.l1_scaling * tf.reduce_mean(tf.abs(self.real_images - self.generated_images))
+
+        t_vars = tf.trainable_variables()
+        self.d_vars = [var for var in t_vars if 'd_' in var.name]
+        self.g_vars = [var for var in t_vars if 'g_' in var.name]
+
+        self.d_optim = tf.train.AdamOptimizer(0.0002, beta1=0.5).minimize(self.d_loss, var_list=self.d_vars)
+        self.g_optim = tf.train.AdamOptimizer(0.0002, beta1=0.5).minimize(self.g_loss, var_list=self.g_vars)
+
+
+    def discriminator(self, image, y=None, reuse=False):
+        # image is 256 x 256 x (input_c_dim + output_c_dim)
+        if reuse:
+            tf.get_variable_scope().reuse_variables()
+        else:
+            assert tf.get_variable_scope().reuse == False
+
+        h0 = lrelu(conv2d(image, self.df_dim, name='d_h0_conv')) # h0 is (128 x 128 x self.df_dim)
+        h1 = lrelu(self.d_bn1(conv2d(h0, self.df_dim*2, name='d_h1_conv'))) # h1 is (64 x 64 x self.df_dim*2)
+        h2 = lrelu(self.d_bn2(conv2d(h1, self.df_dim*4, name='d_h2_conv'))) # h2 is (32 x 32 x self.df_dim*4)
+        h3 = lrelu(self.d_bn3(conv2d(h2, self.df_dim*8, d_h=1, d_w=1, name='d_h3_conv'))) # h3 is (16 x 16 x self.df_dim*8)
+        h4 = linear(tf.reshape(h3, [self.batch_size, -1]), 1, 'd_h3_lin')
+        return tf.nn.sigmoid(h4), h4
+
+    def generator(self, img_in):
+        s = self.output_size
+        s2, s4, s8, s16, s32, s64, s128 = int(s/2), int(s/4), int(s/8), int(s/16), int(s/32), int(s/64), int(s/128)
+        # image is (256 x 256 x input_c_dim)
+        e1 = conv2d(img_in, self.gf_dim, name='g_e1_conv') # e1 is (128 x 128 x self.gf_dim)
+        e2 = bn(conv2d(lrelu(e1), self.gf_dim*2, name='g_e2_conv')) # e2 is (64 x 64 x self.gf_dim*2)
+        e3 = bn(conv2d(lrelu(e2), self.gf_dim*4, name='g_e3_conv')) # e3 is (32 x 32 x self.gf_dim*4)
+        e4 = bn(conv2d(lrelu(e3), self.gf_dim*8, name='g_e4_conv')) # e4 is (16 x 16 x self.gf_dim*8)
+        e5 = bn(conv2d(lrelu(e4), self.gf_dim*8, name='g_e5_conv')) # e5 is (8 x 8 x self.gf_dim*8)
+
+
+        self.d4, self.d4_w, self.d4_b = deconv2d(tf.nn.relu(e5), [self.batch_size, s16, s16, self.gf_dim*8], name='g_d4', with_w=True)
+        d4 = bn(self.d4)
+        d4 = tf.concat(3, [d4, e4])
+        # d4 is (16 x 16 x self.gf_dim*8*2)
+
+        self.d5, self.d5_w, self.d5_b = deconv2d(tf.nn.relu(d4), [self.batch_size, s8, s8, self.gf_dim*4], name='g_d5', with_w=True)
+        d5 = bn(self.d5)
+        d5 = tf.concat(3, [d5, e3])
+        # d5 is (32 x 32 x self.gf_dim*4*2)
+
+        self.d6, self.d6_w, self.d6_b = deconv2d(tf.nn.relu(d5), [self.batch_size, s4, s4, self.gf_dim*2], name='g_d6', with_w=True)
+        d6 = bn(self.d6)
+        d6 = tf.concat(3, [d6, e2])
+        # d6 is (64 x 64 x self.gf_dim*2*2)
+
+        self.d7, self.d7_w, self.d7_b = deconv2d(tf.nn.relu(d6), [self.batch_size, s2, s2, self.gf_dim], name='g_d7', with_w=True)
+        d7 = bn(self.d7)
+        d7 = tf.concat(3, [d7, e1])
+        # d7 is (128 x 128 x self.gf_dim*1*2)
+
+        self.d8, self.d8_w, self.d8_b = deconv2d(tf.nn.relu(d7), [self.batch_size, s, s, self.output_colors], name='g_d8', with_w=True)
+        # d8 is (256 x 256 x output_c_dim)
+
+        return tf.nn.tanh(self.d8)
+
+
+    def imageblur(self, cimg, sampling=False):
+        if sampling:
+            cimg = cimg * 0.3 + np.ones_like(cimg) * 0.7 * 255
+        else:
+            for i in xrange(30):
+                randx = randint(0,205)
+                randy = randint(0,205)
+                cimg[randx:randx+50, randy:randy+50] = 255
+        return cv2.blur(cimg,(100,100))
+
+    def process(self, cimg):
+        mask = np.zeros((4,256,256,1))
+        for x in xrange(4):
+            randx = randint(0,155)
+            randy = randint(0,155)
+            cimg[x,randx:randx+100, randy:randy+100] = 155
+
+            mask[x,randx:randx+100, randy:randy+100] = 1
+        return cimg/255.0, mask
 
 
     def train(self):
-        data = glob(os.path.join("../Datasets/celebA", "*.jpg"))
-        base = np.array([get_image(sample_file, 108, is_crop=True) for sample_file in data[0:64]])
+        self.loadmodel()
+
+        data = glob(os.path.join("imgs", "*.jpg"))
+        print data[0]
+        base = np.array([get_image(sample_file) for sample_file in data[0:self.batch_size]])
+        base_normalized = base/255.0
+
         print base.shape
-        base += 1
-        base /= 2
-        broken_base = np.copy(base)
-        broken_base[:,16:16+32,16:16+32,:] = 0
-        ims("results/base.jpg",merge_color(base,[8,8]))
 
-        #
+        base_broken, base_mask = self.process(base)
+
+        ims("results/base.png",merge_color(base_normalized, [self.batch_size_sqrt, self.batch_size_sqrt]))
+        ims("results/base_broken.jpg",merge_color(base_broken, [self.batch_size_sqrt, self.batch_size_sqrt]))
+        ims("results/base_mask.jpg",merge(base_mask, [self.batch_size_sqrt, self.batch_size_sqrt]))
+
+        datalen = len(data)
+
         for e in xrange(20000):
-            for i in range(len(data) / self.batch_size):
-
+            for i in range(datalen / self.batch_size):
                 batch_files = data[i*self.batch_size:(i+1)*self.batch_size]
-                batch = [get_image(batch_file, 32, is_crop=True) for batch_file in batch_files]
-                batch_images = np.array(batch).astype(np.float32)
-                batch_images += 1
-                batch_images /= 2
-                broken_images = np.copy(batch_images)
-                broken_images[:,16:16+32,16:16+32,:] = 0
+                batch = np.array([get_image(batch_file) for batch_file in batch_files])
+                batch_normalized = batch/255.0
 
-                fill, gen_loss, _ = self.sess.run([self.generated_images, self.generation_loss, self.train_op], feed_dict={self.images: batch_images, self.broken_images: broken_images})
-                print "iter %d genloss %f" % (i, gen_loss)
-                if (i % 30 == 0) or (gen_loss > 10000):
-                    fill = self.sess.run(self.generated_images, feed_dict={self.images: batch_images, self.broken_images: broken_images})
-                    recreation = np.copy(batch_images)
-                    recreation[:,16:16+32,16:16+32,:] = fill
-                    ims("results/"+str(e*10000 + i)+".jpg",merge_color(recreation,[8,8]))
-                    ims("results/"+str(e*10000 + i)+"-base.jpg",merge_color(batch_images,[8,8]))
+                batch_broken, batch_mask = self.process(batch)
+
+                d_loss, _ = self.sess.run([self.d_loss, self.d_optim], feed_dict={self.real_images: batch_normalized, self.line_images: batch_mask, self.color_images: batch_broken})
+                g_loss, _ = self.sess.run([self.g_loss, self.g_optim], feed_dict={self.real_images: batch_normalized, self.line_images: batch_mask, self.color_images: batch_broken})
+
+                print "%d: [%d / %d] d_loss %f, g_loss %f" % (e, i, (datalen/self.batch_size), d_loss, g_loss)
+
+                if i % 3 == 0:
+                    recreation = self.sess.run(self.generated_images, feed_dict={self.real_images: base_normalized, self.line_images: batch_mask, self.color_images: batch_broken})
+                    ims("results/"+str(e*100000 + i)+".jpg",merge_color(recreation, [self.batch_size_sqrt, self.batch_size_sqrt]))
+                    ims("results/"+str(e*100000 + i)+"_broken.jpg",merge_color(batch_broken, [self.batch_size_sqrt, self.batch_size_sqrt]))
+
+                if i % 500 == 0:
+                    self.save("./checkpoint", e*100000 + i)
+
+    def loadmodel(self, load_discrim=True):
+        self.sess = tf.Session()
+        self.sess.run(tf.initialize_all_variables())
+
+        if load_discrim:
+            self.saver = tf.train.Saver()
+        else:
+            self.saver = tf.train.Saver(self.g_vars)
+
+        if self.load("./checkpoint"):
+            print "Loaded"
+        else:
+            print "Load failed"
+
+    def sample(self):
+        self.loadmodel()
+
+        data = glob(os.path.join("imgs", "*.jpg"))
+
+        datalen = len(data)
+
+        for i in range(min(100,datalen / self.batch_size)):
+            batch_files = data[i*self.batch_size:(i+1)*self.batch_size]
+            batch = np.array([get_image(batch_file) for batch_file in batch_files])
+            batch_normalized = batch/255.0
+
+            batch_edge = np.array([cv2.adaptiveThreshold(cv2.cvtColor(ba, cv2.COLOR_BGR2GRAY), 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, blockSize=9, C=2) for ba in batch]) / 255.0
+            batch_edge = np.expand_dims(batch_edge, 3)
+
+            batch_colors = np.array([self.imageblur(ba,True) for ba in batch]) / 255.0
+
+            recreation = self.sess.run(self.generated_images, feed_dict={self.real_images: batch_normalized, self.line_images: batch_edge, self.color_images: batch_colors})
+            ims("results/sample_"+str(i)+".jpg",merge_color(recreation, [self.batch_size_sqrt, self.batch_size_sqrt]))
+            ims("results/sample_"+str(i)+"_origin.jpg",merge_color(batch_normalized, [self.batch_size_sqrt, self.batch_size_sqrt]))
+            ims("results/sample_"+str(i)+"_line.jpg",merge_color(batch_edge, [self.batch_size_sqrt, self.batch_size_sqrt]))
+            ims("results/sample_"+str(i)+"_color.jpg",merge_color(batch_colors, [self.batch_size_sqrt, self.batch_size_sqrt]))
 
 
+    def save(self, checkpoint_dir, step):
+        model_name = "model"
+        model_dir = "tr"
+        checkpoint_dir = os.path.join(checkpoint_dir, model_dir)
 
-model = Inpaint()
-model.train()
+        if not os.path.exists(checkpoint_dir):
+            os.makedirs(checkpoint_dir)
+
+        self.saver.save(self.sess,
+                        os.path.join(checkpoint_dir, model_name),
+                        global_step=step)
+
+    def load(self, checkpoint_dir):
+        print(" [*] Reading checkpoint...")
+
+        model_dir = "tr"
+        checkpoint_dir = os.path.join(checkpoint_dir, model_dir)
+
+        ckpt = tf.train.get_checkpoint_state(checkpoint_dir)
+        if ckpt and ckpt.model_checkpoint_path:
+            ckpt_name = os.path.basename(ckpt.model_checkpoint_path)
+            self.saver.restore(self.sess, os.path.join(checkpoint_dir, ckpt_name))
+            return True
+        else:
+            return False
+
+
+if __name__ == '__main__':
+    if len(sys.argv) < 2:
+        print "Usage: python main.py [train, sample]"
+    else:
+        cmd = sys.argv[1]
+        if cmd == "train":
+            c = Color()
+            c.train()
+        elif cmd == "sample":
+            c = Color()
+            c.sample()
+        else:
+            print "Usage: python main.py [train, sample]"
